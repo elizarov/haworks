@@ -1,0 +1,829 @@
+Index: xbee.c
+===================================================================
+--- xbee.c	(revision 0)
++++ xbee.c	(revision 0)
+@@ -0,0 +1,630 @@
++/*
++ * xbee.c
++ *
++ *  Created on: 13.10.2010
++ *      Author: elizarov
++ */
++
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++
++#include "avrdude.h"
++#include "serial.h"
++
++#ifdef XBEE
++
++#define FRAME_START 0x7e
++#define ESCAPE      0x7d
++#define XON         0x11
++#define XOFF        0x13
++
++#define MAX_NI_LEN 20
++#define ADDR_SIZE 8
++
++// play safe for outgoing packets and get ready for big incoming ones just in case
++#define MAX_OUT_PACKET 64
++#define MAX_IN_PACKET 128
++
++#define API_TRANSMIT                   0x10
++#define API_RECEIVE                    0x90
++#define API_TRANSMIT_STATUS            0x8B
++#define API_AT_COMMAND                 0x08
++#define API_AT_COMMAND_RESPONSE        0x88
++#define API_REMOTE_AT_COMMAND          0x17
++#define API_REMOTE_AT_COMMAND_RESPONSE 0x97
++
++#define APPLY_CHANGES 0x02
++
++#define XBEE_OFF 0x00
++#define XBEE_ON  0x01
++#define XBEE_ACK 0x02
++#define XBEE_CTS 0x04
++#define XBEE_RO  0x08
++#define XBEE_D   0x10
++
++typedef unsigned char byte;
++
++const char XBEE_PREFIX[] = "xbee:";
++const char ACK_OPTION[] = "ack";
++const char CTS_OPTION[] = "cts";
++const char RO_OPTION[] = "ro";
++const char D_OPTION[] = "d";
++
++int xbee_readonly = 0;
++int xbee = XBEE_OFF;
++int ro_option_value;
++int d_option_value = 3;
++
++byte frame_id = 0;
++
++byte broadcast_addr[ADDR_SIZE] = {0, 0, 0, 0, 0, 0, 0xff, 0xff};
++byte local_addr[ADDR_SIZE];
++byte remote_addr[ADDR_SIZE];
++byte dest_addr[ADDR_SIZE];
++
++int rcv_buf_size = 0;
++byte *rcv_buf_ptr;
++byte rcv_buf[MAX_IN_PACKET];
++
++void set_xbee_readonly() {
++	xbee_readonly = 1;
++}
++
++int max_read_page_size(int page_size) {
++	return xbee ? min(MAX_OUT_PACKET, page_size) : page_size;
++}
++
++int cts_out_flow_control() {
++	return xbee & XBEE_CTS;
++}
++
++static void escape(byte **ptr, byte b) {
++	if (b == FRAME_START || b == ESCAPE || b == XON || b == XOFF) {
++		*((*ptr)++) = ESCAPE;
++		b ^= 0x20;
++	}
++	*((*ptr)++) = b;
++}
++
++static void xbee_sendframe(union filedescriptor *fd, byte *data, size_t datasize)
++{
++	byte *frame = malloc(1 + (datasize + 3) * 2);
++	frame[0] = FRAME_START; // start byte
++	byte *ptr = frame + 1;
++	escape(&ptr, datasize >> 8);
++	escape(&ptr, datasize);
++	byte checksum = 0;
++	int i;
++	for (i = 0; i < datasize; i++) {
++		checksum += data[i];
++		escape(&ptr, data[i]);
++	}
++	escape(&ptr, 0xff - checksum);
++	serial_serdev.send(fd, frame, ptr - frame);
++	free(frame);
++}
++
++static byte unescape(union filedescriptor *fd) {
++	byte buf[1];
++	serial_serdev.recv(fd, buf, 1);
++	if (buf[0] != ESCAPE)
++		return buf[0];
++	serial_serdev.recv(fd, buf, 1);
++	return buf[0] ^ 0x20;
++}
++
++static size_t xbee_waitframe(union filedescriptor *fd, byte expected_id, byte *buf, size_t bufsize)
++{
++	byte bytebuf[1];
++	byte received_id;
++	for (;;) {
++		for (;;) {
++			serial_serdev.recv(fd, bytebuf, 1);
++			if (bytebuf[0] == FRAME_START)
++				break;
++			fprintf(stderr,
++					"%s: xbee received byte 0x%x that is not a frame start byte, %x expected\n",
++					progname, bytebuf[0], FRAME_START);
++		}
++		size_t length =  unescape(fd) << 8;
++		length |= unescape(fd);
++		byte *frame = malloc(length);
++		byte checksum = 0;
++		int i;
++		for (i = 0; i < length; i++) {
++			frame[i] = unescape(fd);
++			checksum += frame[i];
++		}
++		received_id = frame[0];
++		if (verbose >= 3)
++			fprintf(stderr,
++					"%s:     xbee received api frame id 0x%02x, length %d\n",
++					progname, received_id, length);
++		if (unescape(fd) != (byte)(0xff - checksum)) {
++			fprintf(stderr,
++					"%s: xbee received api frame with invalid checksum\n",
++					progname);
++			exit(1);
++		}
++		length = min(bufsize, length - 1);
++		memcpy(buf, frame + 1, length);
++		free(frame);
++		if (received_id == expected_id)
++			return length;
++	}
++}
++
++static byte next_frame_id() {
++	frame_id++;
++	if (frame_id == 0)
++		frame_id++;
++	return frame_id;
++}
++
++static size_t xbee_transmit(union filedescriptor *fd, byte *buf, size_t bufsize)
++{
++	// send
++	size_t psize = min(bufsize, MAX_OUT_PACKET);
++	if (verbose >= 3) {
++		fprintf(stderr,
++				"%s: sending %d bytes of data to remote xbee\n",
++				progname, psize);
++	}
++	size_t asize = 14 + psize;
++	byte *snd = malloc(asize);
++	snd[0] = API_TRANSMIT;
++	if (xbee & XBEE_ACK) {
++		snd[1] = next_frame_id();
++	} else {
++		snd[1] = 0; // no ack
++	}
++	memcpy(snd + 2, remote_addr, ADDR_SIZE);
++	snd[10] = 0xff; // unknown 16 bit address
++	snd[11] = 0xfe;
++	snd[12] = 0; // max radius
++	snd[13] = 0; // default options
++	memcpy(snd + 14, buf, psize);
++	xbee_sendframe(fd, snd, asize);
++	free(snd);
++
++	if (xbee & XBEE_ACK) {
++		// wait ack
++		byte rcv[6];
++		size_t len;
++		do {
++			len = xbee_waitframe(fd, API_TRANSMIT_STATUS, rcv, 6);
++		} while (len < 6 || rcv[0] != frame_id);
++		byte retry = rcv[3];
++		byte status = rcv[4];
++		byte discovery = rcv[5];
++		if (status != 0) {
++			if (verbose >= 2)
++				fprintf(stderr,
++						"%s: sending failed with status %d\n",
++						progname, status);
++			return -1;
++		}
++		if ((retry != 0 || discovery != 0) && verbose >= 2) {
++			fprintf(stderr,
++					"%s: sending retried %d times, got discovery status %d\n",
++					progname, retry, discovery);
++		}
++	}
++
++	// return
++	return psize;
++}
++
++static size_t xbee_receive(union filedescriptor *fd, byte *buf, size_t bufsize)
++{
++	if (verbose >= 3) {
++		fprintf(stderr,
++				"%s: receiving at most %d bytes of data from remote xbee\n",
++				progname, bufsize);
++	}
++	// check for leftovers in receive buffer
++	if (rcv_buf_size > 0) {
++		size_t rsize = min(rcv_buf_size, bufsize);
++		memcpy(buf, rcv_buf_ptr, rsize);
++		rcv_buf_size -= rsize;
++		rcv_buf_ptr += rsize;
++		if (verbose >= 3) {
++			fprintf(stderr,
++					"%s: retrieved %d bytes of data from receive buffer\n",
++					progname, rsize);
++		}
++		return rsize;
++	}
++	// receive
++	size_t asize = 11 + MAX_IN_PACKET;
++	byte *rcv = malloc(asize);
++	size_t len;
++	do {
++		len = xbee_waitframe(fd, API_RECEIVE, rcv, asize);
++	} while (len < 11 || memcmp(rcv, remote_addr, ADDR_SIZE) != 0);
++	size_t psize = len - 11;
++	if (verbose >= 3) {
++		fprintf(stderr,
++				"%s: received %d bytes of data from remote xbee\n",
++				progname, psize);
++	}
++	size_t rsize = min(psize, bufsize);
++	memcpy(buf, rcv + 11, rsize);
++	rcv_buf_size = psize - rsize;
++	rcv_buf_ptr = rcv_buf;
++	memcpy(rcv_buf, rcv + 11 + rsize, rcv_buf_size);
++	free(rcv);
++	return rsize;
++}
++
++static size_t xbee_at_command(union filedescriptor *fd, byte *cmd,
++		byte *sdata, size_t sdatasize,
++		byte *rdata, size_t rdatasize)
++{
++	if (verbose >= 3) {
++		fprintf(stderr,
++				"%s:     invoking local AT command %2s\n",
++				progname, cmd);
++	}
++	// send
++	byte *snd = malloc(4 + sdatasize);
++	snd[0] = API_AT_COMMAND; // API id of "at command"
++	snd[1] = next_frame_id(); // frame id
++	snd[2] = cmd[0];
++	snd[3] = cmd[1];
++	memcpy(snd + 4, sdata, sdatasize);
++	xbee_sendframe(fd, snd, 4 + sdatasize);
++	free(snd);
++	// receive
++	byte *rcv = malloc(4 + rdatasize);
++	size_t len;
++	do {
++		len = xbee_waitframe(fd, API_AT_COMMAND_RESPONSE, rcv, 4 + rdatasize);
++	} while (len < 4 || rcv[0] != frame_id || rcv[1] != cmd[0] || rcv[2] != cmd[1]);
++	byte error = rcv[3];
++	memcpy(rdata, rcv + 4, len - 4);
++	free(rcv);
++	// result
++	if (error != 0) {
++		if (verbose >= 2)
++			fprintf(stderr,
++					"%s:     local AT command %2s failed with error code %d\n",
++					progname, cmd, error);
++		return -1;
++	}
++	return len - 4;
++}
++
++static size_t xbee_remote_at_command(union filedescriptor *fd, byte *cmd,
++		byte *sdata, size_t sdatasize,
++		byte *rdata, size_t rdatasize)
++{
++	if (verbose >= 3) {
++		fprintf(stderr,
++				"%s:     invoking remote AT command %2s\n",
++				progname, cmd);
++	}
++	// send
++	byte *snd = malloc(15 + sdatasize);
++	snd[0] = API_REMOTE_AT_COMMAND; // API id of "remote at command"
++	snd[1] = next_frame_id(); // frame id
++	memcpy(snd + 2, remote_addr, ADDR_SIZE);
++	snd[10] = 0xff; // unknown 16 bit address
++	snd[11] = 0xfe;
++	snd[12] = APPLY_CHANGES;
++	snd[13] = cmd[0];
++	snd[14] = cmd[1];
++	memcpy(snd + 15, sdata, sdatasize);
++	xbee_sendframe(fd, snd, 15 + sdatasize);
++	free(snd);
++	// receive
++	byte *rcv = malloc(14 + rdatasize);
++	size_t len;
++	do {
++		len = xbee_waitframe(fd, API_REMOTE_AT_COMMAND_RESPONSE, rcv, 14 + rdatasize);
++	} while (len < 14 || rcv[0] != frame_id ||
++			memcmp(rcv + 1, remote_addr, ADDR_SIZE) != 0 ||
++			rcv[11] != cmd[0] || rcv[12] != cmd[1]);
++	byte error = rcv[13];
++	memcpy(rdata, rcv + 14, len - 14);
++	free(rcv);
++	// result
++	if (error != 0) {
++		if (verbose >= 2)
++			fprintf(stderr,
++					"%s:     remote AT command %2s failed with error code %d\n",
++					progname, cmd, error);
++		return -1;
++	}
++	return len - 14;
++}
++
++static void xbee_identify(union filedescriptor *fd, byte *addr)
++{
++	if (verbose >= 3)
++		fprintf(stderr,
++				"%s: identifying local xbee device\n",
++				progname);
++	int ok = xbee_at_command(fd, "SH", 0, 0, addr, 4) == 4;
++	ok = ok && xbee_at_command(fd, "SL", 0, 0, addr + 4, 4) == 4;
++	if (!ok) {
++		fprintf(stderr,
++				"%s: failed to identify local xbee device\n",
++				progname);
++		exit(1);
++	}
++	if (verbose)
++		fprintf(stderr,
++				"%s: identified local xbee device 0x%02x%02x%02x%02x%02x%02x%02x%02x\n",
++				progname,
++				addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7]);
++}
++
++static void xbee_discover(union filedescriptor *fd, byte *ni, byte *addr)
++{
++	if (verbose >= 3)
++		fprintf(stderr,
++				"%s: discovering remote xbee device %s\n",
++				progname, ni);
++	byte full_addr[2 + ADDR_SIZE];
++	size_t len = xbee_at_command(fd, "DN", ni, strlen(ni), full_addr, 2 + ADDR_SIZE);
++	if (len != 2 + ADDR_SIZE) {
++		fprintf(stderr,
++				"%s: failed to discover remote xbee device %s\n",
++				progname, ni);
++		exit(1);
++	}
++	memcpy(addr, full_addr + 2, ADDR_SIZE);
++	if (verbose)
++		fprintf(stderr,
++				"%s: discovered remote xbee device %s at 0x%02x%02x%02x%02x%02x%02x%02x%02x\n",
++				progname, ni,
++				addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7]);
++}
++
++static void xbee_get_destination(union filedescriptor *fd, byte *addr)
++{
++	if (verbose >= 3)
++		fprintf(stderr,
++				"%s: getting remote xbee destination address\n",
++				progname);
++	int ok = xbee_remote_at_command(fd, "DH", 0, 0, addr, 4) == 4;
++	ok = ok && xbee_remote_at_command(fd, "DL", 0, 0, addr + 4, 4) == 4;
++	if (!ok) {
++		fprintf(stderr,
++				"%s: failed to get remote xbee destination address\n",
++				progname);
++		exit(1);
++	}
++	if (verbose)
++		fprintf(stderr,
++				"%s: got remote xbee destination address of 0x%02x%02x%02x%02x%02x%02x%02x%02x\n",
++				progname,
++				addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7]);
++}
++
++static void xbee_set_destination(union filedescriptor *fd, byte *addr)
++{
++	if (verbose >= 3)
++		fprintf(stderr,
++				"%s: setting remote xbee destination address\n",
++				progname);
++	int ok = xbee_remote_at_command(fd, "DH", addr, 4, 0, 0) == 0;
++	ok = ok && xbee_remote_at_command(fd, "DL", addr + 4, 4, 0, 0) == 0;
++	if (!ok) {
++		fprintf(stderr,
++				"%s: failed to set remote xbee destination address\n",
++				progname);
++		exit(1);
++	}
++	if (verbose)
++		fprintf(stderr,
++				"%s: set remote xbee destination address to 0x%02x%02x%02x%02x%02x%02x%02x%02x\n",
++				progname,
++				addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7]);
++}
++
++static void xbee_set_packetization_timeout(union filedescriptor *fd, byte timeout)
++{
++	if (verbose >= 3)
++		fprintf(stderr,
++				"%s: setting remote xbee packetization timeout\n",
++				progname);
++	if (xbee_remote_at_command(fd, "RO", &timeout, 1, 0, 0) != 0) {
++		fprintf(stderr,
++				"%s: failed to set remote xbee packetization timeout\n",
++				progname);
++		exit(1);
++	}
++	if (verbose)
++		fprintf(stderr,
++				"%s: set remote xbee packetization timeout to %d\n",
++				progname, timeout);
++}
++
++static void xbee_help_and_exit() {
++	fprintf(stderr,
++			"%s: xbee_open(): invalid xbee address syntax, expected xbee:{<option>,}<NI-string>:<port>\n"
++			"\t where valid options are:\n"
++			"\t    ack   - acknowledge every sent packet (will work without hardware flow control)\n"
++			"\t    cts   - use CTS hardware flow control for outgoing data\n"
++			"\t    ro<n> - set remote node packetization timeout to <n> (ATRO<n>)\n"
++			"\t    d<n>  - use DIO <n> to reset remote node (ATD<n>), default is 3\n",
++			progname);
++	exit(1);
++}
++
++static int is_option(char *from, char *to, const char* option, int params) {
++	return (params || to - from == strlen(option)) &&
++			strncmp(from, option, strlen(option)) == 0;
++}
++
++static void xbee_open(char *port, long baud, union filedescriptor *fd)
++{
++	if (strncmp(port, XBEE_PREFIX, strlen(XBEE_PREFIX)) == 0) {
++		char *addr = port + strlen(XBEE_PREFIX);
++		// parse options
++		char *opt;
++		while ((opt = strchr(addr, ','))) {
++			if (is_option(addr, opt, ACK_OPTION, 0) && !(xbee & XBEE_ACK)) {
++				xbee |= XBEE_ACK;
++			} else if (is_option(addr, opt, CTS_OPTION, 0) && !(xbee & XBEE_CTS)) {
++				xbee |= XBEE_CTS;
++			} else if (is_option(addr, opt, RO_OPTION, 1) && !(xbee & XBEE_RO)) {
++				xbee |= XBEE_RO;
++				ro_option_value = strtol(addr + strlen(RO_OPTION), 0, 10);
++			} else if (is_option(addr, opt, D_OPTION, 1) && !(xbee & XBEE_D)) {
++				xbee |= XBEE_D;
++				d_option_value = strtol(addr + strlen(D_OPTION), 0, 10);
++			} else
++				xbee_help_and_exit();
++			addr = opt + 1;
++		}
++		// parse port
++		char *next = strchr(addr, ':');
++		if (!next)
++			xbee_help_and_exit();
++		// copy NI-string
++		byte ni[MAX_NI_LEN + 1];
++		memset(ni, 0, MAX_NI_LEN + 1);
++		strncpy(ni, addr, min(MAX_NI_LEN, next - addr));
++		// open port
++		serial_serdev.open(next + 1, baud, fd);
++		// discover xbee device
++		xbee_discover(fd, ni, remote_addr);
++		if (!xbee_readonly) {
++			// determine our device's id
++			xbee_identify(fd, local_addr);
++			// get old destination address
++			xbee_get_destination(fd, dest_addr);
++			if (memcmp(dest_addr, local_addr, ADDR_SIZE) == 0) {
++				// it is already set to communicate with us... looks we've crashed last time
++				memcpy(dest_addr, broadcast_addr, ADDR_SIZE); // will restore to broadcast
++			} else {
++				// set new destination address (to local)
++				xbee_set_destination(fd, local_addr);
++			}
++			if (xbee & XBEE_RO) {
++				// set remote packetization timeout
++				xbee_set_packetization_timeout(fd, ro_option_value);
++			}
++		}
++		// ready to go!!!
++		xbee |= XBEE_ON;
++		return;
++	}
++	serial_serdev.open(port, baud, fd);
++}
++
++static int xbee_setspeed(union filedescriptor *fd, long baud)
++{
++	if (xbee) {
++		if (verbose)
++			fprintf(stderr,
++					"%s: ignoring request to set baud to %ld in xbee mode\n",
++					progname, baud);
++		return 0;
++	}
++	return serial_serdev.setspeed(fd, baud);
++}
++
++static void xbee_close(union filedescriptor *fd)
++{
++	if (xbee) {
++		if (!xbee_readonly) {
++			// restore old destination address
++			xbee_set_destination(fd, dest_addr);
++		}
++		// done with it
++		xbee = XBEE_OFF;
++	}
++	serial_serdev.close(fd);
++}
++
++static int xbee_send(union filedescriptor *fd, byte *buf, size_t buflen)
++{
++	if (xbee) {
++		while (buflen > 0) {
++			size_t len = xbee_transmit(fd, buf, buflen);
++			if (len < 0) {
++				fprintf(stderr,
++						"%s: failed to transmit data frame\n",
++						progname);
++				exit(1);
++			}
++			buf += len;
++			buflen -= len;
++		}
++		return 0;
++	}
++	return serial_serdev.send(fd, buf, buflen);
++}
++
++static int xbee_recv(union filedescriptor *fd, byte *buf, size_t buflen)
++{
++	if (xbee) {
++		while (buflen > 0) {
++			size_t len = xbee_receive(fd, buf, buflen);
++			if (len < 0) {
++				fprintf(stderr,
++						"%s: failed to receive data frame\n",
++						progname);
++				exit(1);
++			}
++			buf += len;
++			buflen -= len;
++		}
++		return 0;
++	}
++	return serial_serdev.recv(fd, buf, buflen);
++}
++
++static int xbee_drain(union filedescriptor *fd, int display)
++{
++	if (xbee)
++		rcv_buf_size = 0;
++	return serial_serdev.drain(fd, display);
++}
++
++static int xbee_set_dtr_rts(union filedescriptor *fd, int is_on)
++{
++	if (xbee) {
++		if (verbose >= 3)
++			fprintf(stderr,
++					"%s: setting remote xbee dtr/rts %s\n",
++					progname, is_on ? "ON" : "OFF");
++		byte buf[1];
++		byte cmd[] = "D0";
++		cmd[1] += d_option_value;
++		buf[0] = is_on ? 4 : 5;
++		if (xbee_remote_at_command(fd, cmd, buf, 1, 0, 0) != 0) {
++			fprintf(stderr,
++					"%s: failed to set remote xbee dtr/rts %s\n",
++					progname, is_on ? "ON" : "OFF");
++			exit(1);
++		}
++		if (verbose)
++			fprintf(stderr,
++					"%s: set remote xbee dtr/rts %s\n",
++					progname, is_on ? "ON" : "OFF");
++		return 0;
++	}
++	return serial_serdev.set_dtr_rts(fd, is_on);
++}
++
++struct serial_device xbee_serdev =
++{
++	.open = xbee_open,
++	.setspeed = xbee_setspeed,
++	.close = xbee_close,
++	.send = xbee_send,
++	.recv = xbee_recv,
++	.drain = xbee_drain,
++	.set_dtr_rts = xbee_set_dtr_rts,
++	.flags = SERDEV_FL_CANSETSPEED,
++};
++
++struct serial_device *serdev = &xbee_serdev;
++
++#endif // XBEE
+Index: ser_win32.c
+===================================================================
+--- ser_win32.c	(revision 947)
++++ ser_win32.c	(working copy)
+@@ -99,6 +99,9 @@
+ 	dcb.DCBlength = sizeof(DCB);
+ 	dcb.BaudRate = serial_baud_lookup (baud);
+ 	dcb.fBinary = 1;
++#ifdef XBEE
++	dcb.fOutxCtsFlow = cts_out_flow_control() ? TRUE : FALSE;
++#endif
+ 	dcb.fDtrControl = DTR_CONTROL_DISABLE;
+ 	dcb.fRtsControl = RTS_CONTROL_DISABLE;
+ 	dcb.ByteSize = 8;
+@@ -402,6 +405,8 @@
+   .flags = SERDEV_FL_CANSETSPEED,
+ };
+ 
++#ifndef XBEE
+ struct serial_device *serdev = &serial_serdev;
++#endif
+ 
+ #endif /* WIN32NATIVE */
+Index: avrdude.h
+===================================================================
+--- avrdude.h	(revision 947)
++++ avrdude.h	(working copy)
+@@ -22,6 +22,15 @@
+ #ifndef avrdude_h
+ #define avrdude_h
+ 
++// define to have xbee mode available
++#define XBEE
++
++#ifdef XBEE
++extern void set_xbee_readonly();
++extern int max_read_page_size(int page_size);
++extern int cts_out_flow_control();
++#endif
++
+ extern char * progname;		/* name of program, for messages */
+ extern char progbuf[];		/* spaces same length as progname */
+ 
+Index: avr.c
+===================================================================
+--- avr.c	(revision 947)
++++ avr.c	(working copy)
+@@ -177,7 +177,14 @@
+      * efficiently than we can read it directly, so use its routine
+      * instead
+      */
+-    rc = pgm->paged_load(pgm, p, mem, mem->page_size, size);
++
++	// in xbee mode we have to limit transfer page size
++#ifdef XBEE
++    int page_size = max_read_page_size(mem->page_size);
++#else
++    int page_size = mem->page_size;
++#endif
++    rc = pgm->paged_load(pgm, p, mem, page_size, size);
+     if (rc >= 0) {
+       if (strcasecmp(mem->desc, "flash") == 0)
+         return avr_mem_hiaddr(mem);
+Index: bootstrap
+===================================================================
+--- bootstrap	(revision 947)
++++ bootstrap	(working copy)
+@@ -1,5 +1,7 @@
+ #! /bin/sh
+ 
++AM_VER=-1.10
++
+ # autoconf-2.59 or 2.61, 2.62 is known to work
+ 
+ : ${AUTOHEADER="autoheader${AC_VER}"}
+Index: ser_posix.c
+===================================================================
+--- ser_posix.c	(revision 947)
++++ ser_posix.c	(working copy)
+@@ -496,6 +496,8 @@
+   .flags = SERDEV_FL_CANSETSPEED,
+ };
+ 
++#ifndef XBEE
+ struct serial_device *serdev = &serial_serdev;
++#endif
+ 
+ #endif  /* WIN32NATIVE */
+Index: main.c
+===================================================================
+--- main.c	(revision 947)
++++ main.c	(working copy)
+@@ -55,8 +55,8 @@
+ #include "term.h"
+ #include "safemode.h"
+ #include "update.h"
++#include "avrdude.h"
+ 
+-
+ /* Get VERSION from ac_cfg.h */
+ char * version      = VERSION;
+ 
+@@ -115,6 +115,7 @@
+  "  -s                         Silent safemode operation, will not ask you if\n"
+  "                             fuses should be changed back.\n"
+  "  -t                         Enter terminal mode.\n"
++ "  -S                         Print serial port data to stdout instead of exiting.\n"
+  "  -E <exitspec>[,<exitspec>] List programmer exit specifications.\n"
+  "  -x <extended_param>        Pass <extended_param> to programmer.\n"
+  "  -y                         Count # erase cycles in EEPROM.\n"
+@@ -264,6 +265,7 @@
+                           so, 1=erase if we are going to program flash */
+   char  * port;        /* device port (/dev/xxx) */
+   int     terminal;    /* 1=enter terminal mode, 0=don't */
++  int     serial_out;  /* 1=serial out when finished */
+   int     nowrite;     /* don't actually write anything to the chip */
+   int     verify;      /* perform a verify operation */
+   char  * exitspecs;   /* exit specs string from command line */
+@@ -337,6 +339,7 @@
+   p             = NULL;
+   ovsigck       = 0;
+   terminal      = 0;
++  serial_out    = 0;
+   nowrite       = 0;
+   verify        = 1;        /* on by default */
+   quell_progress = 0;
+@@ -400,7 +403,7 @@
+   /*
+    * process command line arguments
+    */
+-  while ((ch = getopt(argc,argv,"?b:B:c:C:DeE:Fi:np:OP:qstU:uvVx:yY:")) != -1) {
++  while ((ch = getopt(argc,argv,"?b:B:c:C:DeE:Fi:np:OP:qsStU:uvVx:yY:")) != -1) {
+ 
+     switch (ch) {
+       case 'b': /* override default programmer baud rate */
+@@ -484,6 +487,10 @@
+         terminal = 1;
+         break;
+ 
++      case 'S': /* serial port output */
++    	serial_out = 1;
++    	break;
++
+       case 'u' : /* Disable safemode */
+         safemode = 0;
+         break;
+@@ -1256,6 +1263,20 @@
+ 
+   pgm->close(pgm);
+ 
++  if (serial_out) {
++    fprintf(stderr, "\n%s: Now opening serial port, press ^C to exit:\n", progname);
++    union filedescriptor fd;
++#ifdef XBEE
++    set_xbee_readonly();
++#endif
++    serial_open(port, baudrate, &fd);
++    char ch;
++    for (;;) {
++      if (serial_recv(&fd, &ch, 1) == 0)
++        putc(ch, stdout);
++    }
++  }
++
+   if (quell_progress < 2) {
+     fprintf(stderr, "\n%s done.  Thank you.\n\n", progname);
+   }
+Index: lexer.l
+===================================================================
+--- lexer.l	(revision 947)
++++ lexer.l	(working copy)
+@@ -37,6 +37,8 @@
+ 
+ #define YY_NO_UNPUT
+ 
++#define CONFIG_DIR "/usr/local/etc"
++
+ %}
+ 
+ DIGIT    [0-9]
+Index: Makefile.am
+===================================================================
+--- Makefile.am	(revision 947)
++++ Makefile.am	(working copy)
+@@ -147,7 +147,8 @@
+ 	usbtiny.h \
+ 	usbtiny.c \
+ 	update.h \
+-	update.c
++	update.c \
++	xbee.c
+ 
+ avrdude_SOURCES = \
+ 	main.c \
